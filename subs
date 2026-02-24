@@ -1,3 +1,4 @@
+To change app id from 1 to 2
 perl -0777 -pe '
 > s{(<field\b[^>]*\bname="ODAPPLID"[^>]*\bstringLength=")\d+(")}{$1."2".$2}ge;
 > 
@@ -7,3 +8,39 @@ perl -0777 -pe '
 >   $blk;
 > }gse;
 > ' input.xml
+
+
+And to add if missing:
+perl -0777 -pe '
+s{(<applicationGroup\b[^>]*>)(.*?)(\n[ \t]*)</applicationGroup>}{
+  my ($open,$body,$close_ws)=($1,$2,$3);
+
+  # Insert ODAPPLID if missing inside this applicationGroup
+  if ($body !~ /<field\b[^>]*\bname="ODAPPLID"/s) {
+
+    # Try to match existing indentation of <field ...> lines
+    my ($field_indent) = $body =~ /(\n[ \t]*)<field\b/;
+    my $unit = ($close_ws =~ /\t/) ? "\t" : "        ";       # tabs or 8 spaces
+    $field_indent //= $close_ws . $unit;                      # one level deeper than </applicationGroup>
+
+    my $map_indent = $field_indent . (($field_indent =~ /\t/) ? "\t" : "        ");
+
+    $body .=
+      $field_indent . q{<field name="ODAPPLID" type="Filter" dataType="string" uniqueID="false" stringLength="2" >} .
+      $map_indent   . q{<mapping dbValue="A " displayedValue="FORMAT1" />} .
+      $map_indent   . q{<mapping dbValue="B " displayedValue="FORMAT2" />} .
+      $field_indent . q{</field>};
+  }
+
+  # Normalize ODAPPLID (existing or newly inserted)
+  $body =~ s{(<field\b[^>]*\bname="ODAPPLID"[^>]*\bstringLength=")\d+(")}{$1."2".$2}ge;
+
+  $body =~ s{(<field\b[^>]*\bname="ODAPPLID"[^>]*>.*?</field>)}{
+    my $blk=$1;
+    $blk =~ s{(<mapping\b[^>]*\bdbValue=")([^"]*)(")}{$1 . sprintf("%-2s",$2) . $3}ge;
+    $blk;
+  }gse;
+
+  $open.$body.$close_ws."</applicationGroup>";
+}gse;
+' input.xml
