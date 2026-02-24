@@ -1,0 +1,9 @@
+perl -0777 -pe '
+> s{(<field\b[^>]*\bname="ODAPPLID"[^>]*\bstringLength=")\d+(")}{$1."2".$2}ge;
+> 
+> s{(<field\b[^>]*\bname="ODAPPLID"[^>]*>.*?</field>)}{
+>   my $blk = $1;
+>   $blk =~ s{(<mapping\b[^>]*\bdbValue=")([^"]*)(")}{$1 . sprintf("%-2s",$2) . $3}ge;
+>   $blk;
+> }gse;
+> ' input.xml
