@@ -1,0 +1,178 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+my ($rules_file, $xml_file, $out_file) = @ARGV;
+die "Usage: $0 rules-input xml-file [output-file]\n"
+    unless $rules_file && $xml_file;
+
+open my $rules_fh, '<', $rules_file
+    or die "Cannot open rules file '$rules_file': $!\n";
+
+my %rules;
+my $appname_from_rules;
+my $idx_from_rules;
+my $need_preprocessor = 0;
+
+# Skip header of Record Rules File
+<$rules_fh>;
+
+while (my $line = <$rules_fh>) {
+    chomp $line;
+    next if $line =~ /^\s*$/;
+    next if $line =~ /^\s*#/;
+
+    my ($archid, $appname, $type, $default, $idx, $dbname, $keyname, $maprule)
+        = split /\s+/, $line, 8;
+
+    next unless defined $dbname && length $dbname;
+
+    $rules{ uc $dbname } = {
+        type    => $type,
+        default => $default,
+        idx     => $idx,
+        appname => $appname,
+        maprule => $maprule,
+    };
+
+    $appname_from_rules //= $appname if defined $appname && length $appname;
+    $idx_from_rules     //= $idx     if defined $idx     && length $idx;
+
+    if (defined $maprule && uc($maprule) eq 'Y') {
+        $need_preprocessor = 1;
+    }
+}
+close $rules_fh;
+
+open my $xml_fh, '<', $xml_file
+    or die "Cannot open XML file '$xml_file': $!\n";
+
+my $out_fh;
+if ($out_file) {
+    open $out_fh, '>', $out_file
+        or die "Cannot open output file '$out_file': $!\n";
+} else {
+    $out_fh = *STDOUT;
+}
+
+while (my $line = <$xml_fh>) {
+
+    # Update the application line
+    if ($line =~ /^(\s*)<application\b.*>\s*$/) {
+        my ($attrs, $attr_names_in_input_order) = parse_attrs($line);
+
+        my $effective_appname = $appname_from_rules || $attrs->{name} || '';
+
+        # Rule 3: update indexer
+        if (defined $idx_from_rules && length $idx_from_rules) {
+            if ($line =~ /\bindexer="[^"]*"/) {
+                $line =~ s/\bindexer="[^"]*"/indexer="$idx_from_rules"/;
+            } else {
+                $line =~ s/\s*>/ indexer="$idx_from_rules" >/;
+            }
+        }
+
+        # Rule 4: add/replace preProcesserCommand after identifier
+        if ($need_preprocessor && length $effective_appname) {
+            my $cmd = qq{/ars/home/bin/indsplitter.pl $effective_appname};
+
+            if ($line =~ /\bpreProcesserCommand="[^"]*"/) {
+                $line =~ s/\bpreProcesserCommand="[^"]*"/preProcesserCommand="$cmd"/;
+            } else {
+                $line =~ s/(identifier="[^"]*")/$1 preProcesserCommand="$cmd"/;
+            }
+        }
+
+        print {$out_fh} $line;
+        next;
+    }
+
+    # Update each preprocessParm line
+    if ($line =~ /^(\s*)<preprocessParm\b(.*?)\/>\s*$/) {
+        my $indent = $1;
+        my $raw    = $2;
+
+        my ($attrs, $orig_attr_order) = parse_attrs($raw);
+
+        my $db_uc = uc($attrs->{dbName} // '');
+
+        # Add leading/trailing to all preprocessParm lines, including LOAD_DATE
+        $attrs->{leading}  = ' ';
+        $attrs->{trailing} = ' ';
+
+        # Apply rule if dbName exists in rules-input
+        if (exists $rules{$db_uc}) {
+            my $default = $rules{$db_uc}{default};
+
+            if (defined $default && length $default) {
+                if (lc($default) eq 'not-to-set') {
+                    delete $attrs->{defaultValue};
+                } else {
+                    $attrs->{defaultValue} = $default;
+                }
+            }
+        }
+
+        # To match your sample output:
+        # if resulting defaultValue is "t" and format is missing, add the date format
+        if (exists $attrs->{defaultValue}
+            && defined $attrs->{defaultValue}
+            && $attrs->{defaultValue} eq 't'
+            && !exists $attrs->{format}) {
+            $attrs->{format} = '%Y/%M/%D';
+        }
+
+        print {$out_fh} build_preprocess_tag($indent, $attrs, $orig_attr_order);
+        next;
+    }
+
+    print {$out_fh} $line;
+}
+
+close $xml_fh;
+close $out_fh if $out_file;
+
+sub parse_attrs {
+    my ($text) = @_;
+    my %attrs;
+    my @attr_names_in_input_order;
+
+    while ($text =~ /([[:alnum:]_:-]+)="([^"]*)"/g) {
+        my ($k, $v) = ($1, $2);
+        push @attr_names_in_input_order, $k unless exists $attrs{$k};
+        $attrs{$k} = $v;
+    }
+
+    return (\%attrs, \@attr_names_in_input_order);
+}
+
+sub build_preprocess_tag {
+    my ($indent, $attrs, $orig_attr_order) = @_;
+
+    my @preferred_attr_out_order = qw(dbName loadIDName defaultValue format leading trailing);
+    my %done;
+    my @pairs;
+
+    for my $k (@preferred_attr_out_order) {
+        next unless exists $attrs->{$k};
+        push @pairs, qq{$k="$attrs->{$k}"};
+        $done{$k} = 1;
+    }
+
+    # Preserve any other original attributes after the preferred ones
+    for my $k (@$orig_attr_order) {
+        next if $done{$k};
+        next unless exists $attrs->{$k};
+        push @pairs, qq{$k="$attrs->{$k}"};
+        $done{$k} = 1;
+    }
+
+    # Any remaining keys not already emitted
+    for my $k (sort keys %$attrs) {
+        next if $done{$k};
+        push @pairs, qq{$k="$attrs->{$k}"};
+    }
+
+    return $indent . '<preprocessParm ' . join(' ', @pairs) . " />\n";
+}
+
