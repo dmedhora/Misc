@@ -1,0 +1,232 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+my ($rules_input_path, $xml_input_path, $xml_output_path) = @ARGV;
+die "Usage: $0 rules-input xml-file [output-file]\n"
+    unless $rules_input_path && $xml_input_path;
+
+open my $rules_fh, '<', $rules_input_path
+    or die "Cannot open rules file '$rules_input_path': $!\n";
+
+my $rules_header_line = <$rules_fh>;
+die "Rules file is empty: '$rules_input_path'\n"
+    unless defined $rules_header_line;
+
+chomp $rules_header_line;
+my @rules_header_names = split /\s+/, $rules_header_line;
+
+for my $required_column (
+    'Group.ARS_DB_Name',
+    'Group.DB_Type',
+    'Indexer',
+    'Default_Value',
+    'Group.Key_Target',
+    'MappingRuleRequired',
+) {
+    die "Missing required column '$required_column' in header\n"
+        unless grep { $_ eq $required_column } @rules_header_names;
+}
+
+my %rules_by_ars_db_name;
+my $application_indexer_value;
+my $application_needs_preprocessor_command = 0;
+my $rules_line_number = 1;
+
+while (my $line = <$rules_fh>) {
+    $rules_line_number++;
+    chomp $line;
+
+    next if $line =~ /^\s*$/;
+    next if $line =~ /^\s*#/;
+
+    my @field_values = split /\s+/, $line;
+
+    my $rule_record = build_rule_record(
+        \@rules_header_names,
+        \@field_values,
+        $rules_line_number,
+        $line,
+    );
+
+    next unless $rule_record;
+
+    my $ars_db_name = $rule_record->{'Group.ARS_DB_Name'} // '';
+    next unless length $ars_db_name;
+
+    $rules_by_ars_db_name{ uc $ars_db_name } = {
+        ars_db_name           => $rule_record->{'Group.ARS_DB_Name'},
+        key_target            => $rule_record->{'Group.Key_Target'},
+        db_type               => $rule_record->{'Group.DB_Type'},
+        indexer               => $rule_record->{'Indexer'},
+        default_value         => $rule_record->{'Default_Value'},
+        mapping_rule_required => $rule_record->{'MappingRuleRequired'},
+    };
+
+    $application_indexer_value //= $rule_record->{'Indexer'};
+
+    if (defined $rule_record->{'MappingRuleRequired'}
+        && uc($rule_record->{'MappingRuleRequired'}) eq 'Y') {
+        $application_needs_preprocessor_command = 1;
+    }
+}
+close $rules_fh;
+
+open my $xml_fh, '<', $xml_input_path
+    or die "Cannot open XML file '$xml_input_path': $!\n";
+
+my $output_fh;
+if ($xml_output_path) {
+    open $output_fh, '>', $xml_output_path
+        or die "Cannot open output file '$xml_output_path': $!\n";
+} else {
+    $output_fh = *STDOUT;
+}
+
+while (my $line = <$xml_fh>) {
+
+    if ($line =~ /^(\s*)<application\b.*>\s*$/) {
+        my ($application_attrs) = parse_attrs($line);
+        my $application_name = $application_attrs->{name} // '';
+
+        if (defined $application_indexer_value && length $application_indexer_value) {
+            if ($line =~ /\bindexer="[^"]*"/) {
+                $line =~ s/\bindexer="[^"]*"/indexer="$application_indexer_value"/;
+            } else {
+                $line =~ s/\s*>/ indexer="$application_indexer_value" >/;
+            }
+        }
+
+        if ($application_needs_preprocessor_command && length $application_name) {
+            my $preprocessor_command = qq{/ars/home/bin/indsplitter.pl $application_name};
+
+            if ($line =~ /\bpreProcesserCommand="[^"]*"/) {
+                $line =~ s/\bpreProcesserCommand="[^"]*"/preProcesserCommand="$preprocessor_command"/;
+            } else {
+                $line =~ s/(identifier="[^"]*")/$1 preProcesserCommand="$preprocessor_command"/;
+            }
+        }
+
+        print {$output_fh} $line;
+        next;
+    }
+
+    if ($line =~ /^(\s*)<preprocessParm\b(.*?)\/>\s*$/) {
+        my $indentation = $1;
+        my $raw_attribute_text = $2;
+
+        my ($preprocess_attrs, $original_attribute_order) = parse_attrs($raw_attribute_text);
+
+        my $normalized_db_name = uc($preprocess_attrs->{dbName} // '');
+
+        if ($normalized_db_name eq 'LOAD_DATE') {
+            $preprocess_attrs->{leading}  = ' ';
+            $preprocess_attrs->{trailing} = ' ';
+        }
+        elsif (exists $rules_by_ars_db_name{$normalized_db_name}) {
+            my $rule = $rules_by_ars_db_name{$normalized_db_name};
+
+            $preprocess_attrs->{dbName}     = $rule->{ars_db_name} if length($rule->{ars_db_name} // '');
+            $preprocess_attrs->{loadIDName} = $rule->{key_target}  if length($rule->{key_target}  // '');
+
+            if (defined $rule->{db_type} && uc($rule->{db_type}) eq 'CHAR') {
+                $preprocess_attrs->{leading}  = ' ';
+                $preprocess_attrs->{trailing} = ' ';
+            }
+
+            if (defined $rule->{default_value} && length $rule->{default_value}) {
+                if (lc($rule->{default_value}) eq 'do_not_set') {
+                    delete $preprocess_attrs->{defaultValue};
+                } else {
+                    $preprocess_attrs->{defaultValue} = $rule->{default_value};
+                }
+            }
+        }
+
+        if (($preprocess_attrs->{defaultValue} // '') eq 't'
+            && !exists $preprocess_attrs->{format}) {
+            $preprocess_attrs->{format} = '%Y/%M/%D';
+        }
+
+        print {$output_fh} build_preprocess_tag(
+            $indentation,
+            $preprocess_attrs,
+            $original_attribute_order,
+        );
+        next;
+    }
+
+    print {$output_fh} $line;
+}
+
+close $xml_fh;
+close $output_fh if $xml_output_path;
+
+sub build_rule_record {
+    my ($rules_header_names, $field_values, $line_number, $raw_line) = @_;
+
+    my @values = @$field_values;
+
+    if (@values != @$rules_header_names) {
+        warn "Skipping malformed line $line_number: expected "
+           . scalar(@$rules_header_names) . " fields, got "
+           . scalar(@values) . "\n";
+        warn "  $raw_line\n";
+        return;
+    }
+
+    my %rule_record;
+    @rule_record{@$rules_header_names} = @values;
+    return \%rule_record;
+}
+
+sub parse_attrs {
+    my ($text) = @_;
+    my %attrs;
+    my @attribute_names_in_input_order;
+
+    while ($text =~ /([[:alnum:]_:-]+)="([^"]*)"/g) {
+        my ($attribute_name, $attribute_value) = ($1, $2);
+        push @attribute_names_in_input_order, $attribute_name
+            unless exists $attrs{$attribute_name};
+        $attrs{$attribute_name} = $attribute_value;
+    }
+
+    return (\%attrs, \@attribute_names_in_input_order);
+}
+
+sub build_preprocess_tag {
+    my ($indentation, $attrs, $original_attribute_order) = @_;
+
+    my @preferred_attribute_output_order = qw(
+        dbName
+        loadIDName
+        defaultValue
+        format
+        leading
+        trailing
+    );
+
+    my %already_output;
+    my @rendered_pairs;
+
+    for my $attribute_name (@preferred_attribute_output_order) {
+        next unless exists $attrs->{$attribute_name};
+        push @rendered_pairs, qq{$attribute_name="$attrs->{$attribute_name}"};
+        $already_output{$attribute_name} = 1;
+    }
+
+    for my $attribute_name (@$original_attribute_order) {
+        next if $already_output{$attribute_name};
+        next unless exists $attrs->{$attribute_name};
+        push @rendered_pairs, qq{$attribute_name="$attrs->{$attribute_name}"};
+        $already_output{$attribute_name} = 1;
+    }
+
+    for my $attribute_name (sort keys %$attrs) {
+        next if $already_output{$attribute_name};
+        push @rendered_pairs, qq{$attribute_name="$attrs->{$attribute_name}"};
+    }
+
+    return $indentation . '<preprocessParm ' . join(' ', @rendered_pairs) . " />\n";
+}
